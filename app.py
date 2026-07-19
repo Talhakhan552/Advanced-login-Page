@@ -1,19 +1,21 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request
 from flask_cors import CORS
 import psycopg2
 from psycopg2.extras import RealDictCursor
 import jwt
 import bcrypt
 import hashlib
-from datetime import datetime, timedelta
+import re
+from datetime import datetime, timedelta, timezone
 from functools import wraps
 import os
 from dotenv import load_dotenv
 
+
+
 load_dotenv()
 
 app = Flask(__name__)
-CORS(app)
 
 # Configuration from .env file
 DB_HOST = os.getenv('DB_HOST', 'localhost')
@@ -24,11 +26,31 @@ DB_PASSWORD = os.getenv('DB_PASSWORD', 'password')
 
 ACCESS_TOKEN_SECRET = os.getenv('ACCESS_TOKEN_SECRET', 'access-secret')
 REFRESH_TOKEN_SECRET = os.getenv('REFRESH_TOKEN_SECRET', 'refresh-secret')
+FRONTEND_URL = os.getenv('FRONTEND_URL', 'http://localhost:3000')
+FLASK_DEBUG = os.getenv('FLASK_DEBUG', 'False').lower() == 'true'
+
+CORS(app, origins=[FRONTEND_URL])
+
+EMAIL_PATTERN = re.compile(r'^[^@]+@[^@]+\.[^@]+$')
 
 print(f"🔌 Connecting to PostgreSQL...")
 print(f"   Host: {DB_HOST}:{DB_PORT}")
 print(f"   Database: {DB_NAME}")
 print(f"   User: {DB_USER}")
+
+# ============ HELPERS ============
+
+def utc_now():
+    return datetime.now(timezone.utc)
+
+def validate_registration(username, email, password):
+    if len(username) < 3 or len(username) > 50:
+        return 'Username must be between 3 and 50 characters'
+    if not EMAIL_PATTERN.match(email) or len(email) > 100:
+        return 'Invalid email address'
+    if len(password) < 8:
+        return 'Password must be at least 8 characters'
+    return None
 
 # ============ DATABASE FUNCTIONS ============
 
@@ -138,6 +160,10 @@ def register():
         # Validate input
         if not username or not email or not password:
             return {'message': 'Missing required fields: username, email, password'}, 400
+
+        validation_error = validate_registration(username.strip(), email.strip(), password)
+        if validation_error:
+            return {'message': validation_error}, 400
         
         conn = get_db_connection()
         if not conn:
@@ -146,7 +172,7 @@ def register():
         cur = conn.cursor(cursor_factory=RealDictCursor)
         
         # SQL: Check if user already exists
-        cur.execute('SELECT id FROM users WHERE username = %s OR email = %s', (username, email))
+        cur.execute('SELECT id FROM users WHERE username = %s OR email = %s', (username.strip(), email.strip()))
         if cur.fetchone():
             cur.close()
             conn.close()
@@ -159,7 +185,7 @@ def register():
         # SQL: Insert new user into database
         cur.execute(
             'INSERT INTO users (username, email, password_hash, role) VALUES (%s, %s, %s, %s) RETURNING id, username, email, role',
-            (username, email, password_hash, 'user')
+            (username.strip(), email.strip(), password_hash, 'user')
         )
         new_user = cur.fetchone()
         conn.commit()
@@ -207,7 +233,7 @@ def login():
         
         # SQL: Get user from database
         cur.execute(
-            'SELECT id, username, email, password_hash, role FROM users WHERE username = %s',
+            'SELECT id, username, email, password_hash, role, created_at FROM users WHERE username = %s',
             (username,)
         )
         user = cur.fetchone()
@@ -222,6 +248,12 @@ def login():
             cur.close()
             conn.close()
             return {'message': 'Invalid credentials'}, 401
+
+        # Revoke existing refresh tokens for this user
+        cur.execute(
+            'UPDATE refresh_tokens SET revoked = TRUE WHERE user_id = %s AND revoked = FALSE',
+            (user['id'],)
+        )
         
         # Generate ACCESS TOKEN (short-lived: 15 minutes)
         # This token is sent with each request to prove authentication
@@ -230,7 +262,7 @@ def login():
                 'id': user['id'],
                 'username': user['username'],
                 'role': user['role'],
-                'exp': datetime.utcnow() + timedelta(minutes=15)  # Expires in 15 min
+                'exp': utc_now() + timedelta(minutes=15)
             },
             ACCESS_TOKEN_SECRET,
             algorithm='HS256'
@@ -241,7 +273,7 @@ def login():
         refresh_token = jwt.encode(
             {
                 'id': user['id'],
-                'exp': datetime.utcnow() + timedelta(days=7)  # Expires in 7 days
+                'exp': utc_now() + timedelta(days=7)
             },
             REFRESH_TOKEN_SECRET,
             algorithm='HS256'
@@ -250,7 +282,7 @@ def login():
         # SQL: Store refresh token hash in database
         # We store the HASH, not the raw token (for security)
         token_hash = hash_token(refresh_token)
-        expires_at = datetime.utcnow() + timedelta(days=7)
+        expires_at = utc_now() + timedelta(days=7)
         
         cur.execute(
             'INSERT INTO refresh_tokens (user_id, token_hash, expires_at) VALUES (%s, %s, %s)',
@@ -268,7 +300,8 @@ def login():
                 'id': user['id'],
                 'username': user['username'],
                 'email': user['email'],
-                'role': user['role']
+                'role': user['role'],
+                'created_at': user['created_at'].isoformat() if user['created_at'] else None
             }
         }, 200
     
@@ -289,7 +322,8 @@ def refresh():
     
     Returns:
     {
-        "accessToken": "NEW_JWT_TOKEN"
+        "accessToken": "NEW_JWT_TOKEN",
+        "refreshToken": "NEW_REFRESH_TOKEN"
     }
     """
     try:
@@ -323,6 +357,12 @@ def refresh():
             cur.close()
             conn.close()
             return {'message': 'Invalid or expired refresh token'}, 403
+
+        # Revoke the used refresh token (rotation)
+        cur.execute(
+            'UPDATE refresh_tokens SET revoked = TRUE WHERE token_hash = %s',
+            (token_hash,)
+        )
         
         # SQL: Get updated user info
         cur.execute(
@@ -331,10 +371,9 @@ def refresh():
         )
         user = cur.fetchone()
         
-        cur.close()
-        conn.close()
-        
         if not user:
+            cur.close()
+            conn.close()
             return {'message': 'User not found'}, 404
         
         # Generate new access token
@@ -343,14 +382,37 @@ def refresh():
                 'id': user['id'],
                 'username': user['username'],
                 'role': user['role'],
-                'exp': datetime.utcnow() + timedelta(minutes=15)
+                'exp': utc_now() + timedelta(minutes=15)
             },
             ACCESS_TOKEN_SECRET,
             algorithm='HS256'
         )
+
+        # Generate and store new refresh token
+        new_refresh_token = jwt.encode(
+            {
+                'id': user['id'],
+                'exp': utc_now() + timedelta(days=7)
+            },
+            REFRESH_TOKEN_SECRET,
+            algorithm='HS256'
+        )
+        new_token_hash = hash_token(new_refresh_token)
+        expires_at = utc_now() + timedelta(days=7)
+
+        cur.execute(
+            'INSERT INTO refresh_tokens (user_id, token_hash, expires_at) VALUES (%s, %s, %s)',
+            (user['id'], new_token_hash, expires_at)
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
         
         print(f"✅ Token refreshed for user ID: {user['id']}")
-        return {'accessToken': new_access_token}, 200
+        return {
+            'accessToken': new_access_token,
+            'refreshToken': new_refresh_token
+        }, 200
     
     except Exception as e:
         print(f"❌ Refresh error: {e}")
@@ -382,12 +444,16 @@ def logout():
         cur = conn.cursor()
         token_hash = hash_token(refresh_token)
         
-        # SQL: Mark token as revoked in database
-        # This prevents it from being used to get new access tokens
+        # SQL: Mark token as revoked only if it belongs to the authenticated user
         cur.execute(
-            'UPDATE refresh_tokens SET revoked = TRUE WHERE token_hash = %s',
-            (token_hash,)
+            'UPDATE refresh_tokens SET revoked = TRUE WHERE token_hash = %s AND user_id = %s',
+            (token_hash, request.user_id)
         )
+        if cur.rowcount == 0:
+            cur.close()
+            conn.close()
+            return {'message': 'Invalid refresh token'}, 403
+
         conn.commit()
         cur.close()
         conn.close()
@@ -488,7 +554,7 @@ def update_user_role(user_id):
         
         # SQL: Update user role in database
         cur.execute(
-            'UPDATE users SET role = %s, updated_at = NOW() WHERE id = %s RETURNING id, username, role',
+            'UPDATE users SET role = %s, updated_at = NOW() WHERE id = %s RETURNING id, username, email, role, created_at',
             (new_role, user_id)
         )
         updated_user = cur.fetchone()
@@ -527,4 +593,4 @@ if __name__ == '__main__':
     print("⏹️  Press Ctrl+C to stop the server")
     print()
     
-    app.run(debug=True, port=5000, host='127.0.0.1')
+    app.run(debug=FLASK_DEBUG, port=5000, host='127.0.0.1')
